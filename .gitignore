@@ -1,3 +1,5 @@
 ./history
 .env
 .history
+chat_history/
+docs/

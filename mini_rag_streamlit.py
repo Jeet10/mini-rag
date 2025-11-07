@@ -399,6 +399,8 @@ if "mode" not in st.session_state:
     st.session_state.mode = "strict"
 if "generating" not in st.session_state:
     st.session_state.generating = False  # lock input while generating
+if "pending_q" not in st.session_state:
+    st.session_state.pending_q = None     # <-- for two-step handoff
 
 # --- Front-end guard: block Enter when generating ---
 components.html(f"""
@@ -509,20 +511,21 @@ for i, (role, msg) in enumerate(normalize_messages(st.session_state.messages)):
         if role == "assistant" and msg.strip():
             copy_button(msg, key=f"copy_btn_{i}")
 
-# --- Chat input (hard-locked while generating) ---
-if st.session_state.generating:
+# ---------------- Chat input (two-step handoff) ----------------
+# 1) If not generating: capture input, set lock + pending, and rerun immediately.
+if not st.session_state.generating:
+    q = st.chat_input("Ask something about your documents…")
+    if q:
+        st.session_state.pending_q = q
+        st.session_state.generating = True
+        st.rerun()
+else:
+    # show disabled input while generating (prevents accidental Enter)
     st.chat_input("Generating… please wait", disabled=True)
-    st.stop()  # absolute guard
 
-q = st.chat_input("Ask something about your documents…")
-if q:
-    # Double-guard (in case state flips mid-render)
-    if st.session_state.generating:
-        st.warning("Still generating the previous answer. Please wait a moment.")
-        st.stop()
-
-    # lock immediately
-    st.session_state.generating = True
+# 2) If we have a pending query and we're in generating mode, process it now.
+if st.session_state.generating and st.session_state.pending_q:
+    q = st.session_state.pending_q
 
     # log user message
     st.session_state.messages.append(("user", q))
@@ -540,6 +543,8 @@ if q:
         ctx = []
         with st.chat_message("assistant"):
             st.error(f"Retrieval error: {e}")
+        # unlock & clear pending, then persist
+        st.session_state.pending_q = None
         st.session_state.generating = False
         save_session(st.session_state.session_id, st.session_state.title, st.session_state.messages)
         st.stop()
@@ -561,8 +566,9 @@ if q:
             streamed_text += f"\n\n[Streaming error: {e}]"
             placeholder.markdown(streamed_text)
 
-    # Save, unlock, and rerun so Copy button renders on the final message
+    # Save, unlock, clear pending, and rerun so Copy button renders on the final message
     st.session_state.messages.append(("assistant", streamed_text))
     save_session(st.session_state.session_id, st.session_state.title, st.session_state.messages)
+    st.session_state.pending_q = None
     st.session_state.generating = False
     st.rerun()
