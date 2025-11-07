@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-# Mini RAG Chat — ChatGPT-like sessions (auto-load on click, auto-save, auto-scroll)
-# RAG: FAISS + MiniLM (local embeddings) + OpenAI/Azure; supports .txt/.md/.pdf
+# Minimal RAG Chat — streaming + sturdy
+# - Ingest .txt/.md/.pdf → chunk → embed (MiniLM) → FAISS → retrieve → LLM (OpenAI/Azure)
+# - Titles stored in same JSON; Rename/Delete via label-less popover (no icon text)
+# - No empty chat saves; First load = new chat
+# - Robust legacy history handling
+# - Streaming assistant responses (ChatGPT-like)
 
 import os
 import io
@@ -13,13 +17,12 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 import faiss
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from dotenv import load_dotenv
 
-# LLM clients
+# ---- LLM clients ----
 try:
     from openai import OpenAI, AzureOpenAI
 except Exception:
@@ -28,7 +31,7 @@ except Exception:
 
 load_dotenv()
 
-# ----------- Constants -----------
+# ---- Constants ----
 DATA_DIR = "docs"
 INDEX_PATH = "faiss.index"
 META_PATH = "faiss_meta.pkl"
@@ -38,13 +41,118 @@ DEFAULT_MODEL = "gpt-4o-mini"
 HIST_DIR = Path("chat_history")
 HIST_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---- Data model ----
 @dataclass
 class Chunk:
     text: str
     source: str
 
+# ---- Utils: normalize message shapes ----
+def normalize_messages(raw) -> List[Tuple[str, str]]:
+    """
+    Convert various message shapes to list[(role, content)].
+    Accepts dicts with {role,content} or 2-item lists/tuples.
+    Skips malformed entries safely.
+    """
+    out: List[Tuple[str, str]] = []
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for item in raw:
+        try:
+            if isinstance(item, dict):
+                role = item.get("role")
+                content = item.get("content")
+                if isinstance(role, str) and isinstance(content, str):
+                    out.append((role, content))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                role, content = item[0], item[1]
+                if isinstance(role, str) and isinstance(content, str):
+                    out.append((role, content))
+        except Exception:
+            continue
+    return out
 
-# ----------- Embeddings / FAISS -----------
+def derive_title_from_messages(messages: List[Tuple[str, str]]) -> str:
+    for role, msg in normalize_messages(messages):
+        if role == "user" and msg.strip():
+            first = msg.strip().split("\n")[0]
+            return (first[:30] + "…") if len(first) > 30 else first
+    return "New chat"
+
+# ---- Session storage (title + messages inside ONE JSON) ----
+def default_session_id() -> str:
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+def session_path(session_id: str) -> Path:
+    return HIST_DIR / f"{session_id}.json"
+
+def load_session(session_id: str):
+    """
+    Returns (title, messages). Backward compatible with legacy list-only files.
+    """
+    p = session_path(session_id)
+    if not p.exists():
+        return "New chat", []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return "New chat", []
+    # Modern format: {"title": str, "messages": [...]}
+    if isinstance(data, dict) and "messages" in data:
+        title = data.get("title") or "New chat"
+        messages = normalize_messages(data["messages"])
+        return title, messages
+    # Legacy format: just a list of messages
+    if isinstance(data, list):
+        messages = normalize_messages(data)
+        title = derive_title_from_messages(messages)
+        return title, messages
+    return "New chat", []
+
+def save_session(session_id: str, title: str, messages) -> None:
+    """
+    Saves {"title": title, "messages": normalized_messages} to one JSON file.
+    Won't save empty-chats (no messages).
+    """
+    msgs = normalize_messages(messages)
+    if not msgs:
+        return
+    payload = {"title": title or "New chat", "messages": msgs}
+    with open(session_path(session_id), "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def list_sessions_with_titles() -> List[Tuple[str, str]]:
+    """
+    Returns list of (session_id, title), newest first by mtime.
+    """
+    items = []
+    files = sorted(HIST_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files:
+        sid = p.stem
+        title, _ = load_session(sid)
+        items.append((sid, title))
+    return items
+
+def rename_session(session_id: str, new_title: str) -> None:
+    """
+    Update the title inside the same JSON file.
+    """
+    _, messages = load_session(session_id)
+    new_title = (new_title or "").strip()
+    if not new_title:
+        return
+    save_session(session_id, new_title, messages)
+
+def delete_session(session_id: str) -> None:
+    p = session_path(session_id)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+# ---- Embeddings / FAISS ----
 @st.cache_resource(show_spinner=False)
 def get_embedder():
     return SentenceTransformer(EMBED_MODEL)
@@ -78,8 +186,7 @@ def load_index():
         meta = pickle.load(f)
     return idx, meta
 
-
-# ----------- Ingestion (.txt/.md/.pdf) -----------
+# ---- Ingestion (.txt/.md/.pdf) ----
 def read_txt_md(folder: str) -> List[Tuple[str, str]]:
     paths = glob.glob(os.path.join(folder, "**", "*.txt"), recursive=True)
     paths += glob.glob(os.path.join(folder, "**", "*.md"), recursive=True)
@@ -136,8 +243,7 @@ def retrieve(question: str, k: int):
     _, I = idx.search(qvec, k)
     return [meta[i] for i in I[0] if i != -1]
 
-
-# ----------- LLM -----------
+# ---- LLM ----
 def ensure_llm_client():
     if os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"):
         if AzureOpenAI is None:
@@ -152,119 +258,95 @@ def ensure_llm_client():
         raise RuntimeError("Set OPENAI_API_KEY or AZURE_* environment variables.")
     return OpenAI(api_key=api_key), False
 
-def llm_answer(question: str, context_chunks: List[Chunk]) -> str:
+def llm_answer_stream(question: str, context_chunks: List[Chunk]):
+    """
+    Stream tokens as they arrive (ChatGPT-style).
+    Yields small string pieces progressively.
+    """
     client, is_azure = ensure_llm_client()
     context_text = "\n\n".join(f"[{os.path.basename(c.source)}]\n{c.text}" for c in context_chunks)
     model = os.getenv("AZURE_OPENAI_DEPLOYMENT") if is_azure else os.getenv("OPENAI_CHAT_MODEL", DEFAULT_MODEL)
-    resp = client.chat.completions.create(
+
+    stream = client.chat.completions.create(
         model=model,
+        stream=True,
         messages=[
             {"role": "system", "content": "Answer only using the provided context. If not present, say you don't know."},
             {"role": "user", "content": f"Question: {question}\n\nContext:\n{context_text}"},
         ],
         temperature=0.2,
     )
-    return resp.choices[0].message.content.strip()
 
+    # OpenAI ChatCompletionChunk has choices[0].delta.content pieces
+    for chunk in stream:
+        try:
+            delta = chunk.choices[0].delta
+            if delta and getattr(delta, "content", None):
+                yield delta.content
+        except Exception:
+            # Skip malformed chunks silently
+            continue
 
-# ----------- Chat History (auto-save, auto-load, titles) -----------
-def default_session_id() -> str:
-    # Stable ID with timestamp; title is derived from first user message
-    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+# ==== STREAMLIT UI ====
+st.set_page_config(page_title="Mini RAG — Minimal Chat", page_icon="💬", layout="wide")
+st.title("💬 Mini RAG — Minimal Chat (Streaming)")
+st.caption("Titles stored per JSON • Label-less menu • No empty chat saves • PDF/TXT/MD • FAISS + MiniLM • OpenAI/Azure • Streaming")
 
-def session_file(session_id: str) -> Path:
-    return HIST_DIR / f"{session_id}.json"
-
-def save_chat(session_id: str, messages: List[Tuple[str, str]]) -> None:
-    with open(session_file(session_id), "w", encoding="utf-8") as f:
-        json.dump(messages, f, ensure_ascii=False, indent=2)
-
-def load_chat(session_id: str) -> List[Tuple[str, str]]:
-    p = session_file(session_id)
-    if not p.exists():
-        return []
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def list_sessions() -> List[str]:
-    # Return IDs sorted by mtime desc (newest first)
-    files = sorted(HIST_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [p.stem for p in files]
-
-def session_title(session_id: str, messages: List[Tuple[str, str]]) -> str:
-    # Title = first user message (trimmed) or timestamp
-    for role, msg in messages:
-        if role == "user" and msg.strip():
-            title = msg.strip().split("\n")[0]
-            return (title[:30] + "…") if len(title) > 30 else title
-    # Fallback to session id formatted
-    return session_id.replace("_", " ")
-
-def get_all_session_titles() -> List[Tuple[str, str]]:
-    # [(session_id, title)]
-    ids = list_sessions()
-    out = []
-    for sid in ids:
-        msgs = load_chat(sid)
-        out.append((sid, session_title(sid, msgs)))
-    return out
-
-
-# ----------- Streamlit UI -----------
-st.set_page_config(page_title="Mini RAG — Chat (ChatGPT-like)", page_icon="💬", layout="wide")
-st.title("💬 Mini RAG — Chat with Your Documents")
-st.caption("ChatGPT-like sidebar • Auto-load on click • Auto-save continuously • Auto-scroll • PDF/TXT/MD")
-
-# State init
+# First load → new chat in memory (unsaved until first user message)
 if "session_id" not in st.session_state:
     st.session_state.session_id = default_session_id()
+if "title" not in st.session_state:
+    st.session_state.title = "New chat"
 if "messages" not in st.session_state:
-    st.session_state.messages: List[Tuple[str, str]] = load_chat(st.session_state.session_id)
+    st.session_state.messages: List[Tuple[str, str]] = []
 if "k" not in st.session_state:
     st.session_state.k = 4
 
-# ----- Sidebar: Chat list + New Chat + Documents -----
+# ----- Sidebar: Chats & Docs -----
 with st.sidebar:
     st.subheader("💬 Chats")
 
-    # New chat button (like ChatGPT)
+    # New chat (unsaved until first message)
     if st.button("＋ New chat", use_container_width=True):
         st.session_state.session_id = default_session_id()
+        st.session_state.title = "New chat"
         st.session_state.messages = []
-        save_chat(st.session_state.session_id, st.session_state.messages)
         st.rerun()
 
-    # Clickable chat list (radio). Selecting a chat auto-loads it (no button).
-    chat_items = get_all_session_titles()
-    if not chat_items:
-        st.info("No chats yet. Click **＋ New chat** to start.")
-        selected_label = None
-    else:
-        labels = [f"{title}" for _, title in chat_items]
-        ids = [sid for sid, _ in chat_items]
-        # Preselect current session if present
-        try:
-            default_idx = ids.index(st.session_state.session_id)
-        except ValueError:
-            default_idx = 0
-        selected_label = st.radio(
-            "History",
-            options=labels,
-            index=default_idx,
-            label_visibility="collapsed",
-        )
-        # Detect selection change and auto-load
-        if selected_label is not None:
-            sel_idx = labels.index(selected_label)
-            sel_id = ids[sel_idx]
-            if sel_id != st.session_state.session_id:
-                st.session_state.session_id = sel_id
-                st.session_state.messages = load_chat(sel_id)
-                st.rerun()
+    # Chat list: main button + label-less popover (Rename/Delete)
+    for sid, title in list_sessions_with_titles():
+        cols = st.columns([7, 2], vertical_alignment="center")
+
+        if cols[0].button(title, key=f"open_{sid}", use_container_width=True):
+            t, msgs = load_session(sid)
+            st.session_state.session_id = sid
+            st.session_state.title = t
+            st.session_state.messages = msgs
+            st.rerun()
+
+        with cols[1]:
+            # NOTE: per your request, no visible label/icon on the trigger
+            try:
+                pop = st.popover("")
+            except Exception:
+                pop = st.expander("")
+            with pop:
+                new_name = st.text_input("Rename", value=title, key=f"name_{sid}")
+                if st.button("Rename", key=f"rename_{sid}", use_container_width=True):
+                    rename_session(sid, new_name)
+                    st.rerun()
+                if st.button("Delete", key=f"delete_{sid}", use_container_width=True):
+                    deleting_current = (sid == st.session_state.session_id)
+                    delete_session(sid)
+                    if deleting_current:
+                        # return to fresh, unsaved chat
+                        st.session_state.session_id = default_session_id()
+                        st.session_state.title = "New chat"
+                        st.session_state.messages = []
+                    st.rerun()
 
     st.divider()
     st.subheader("📄 Documents & Index")
-
     st.session_state.k = st.number_input("Top-K Retrieval", min_value=1, max_value=12, value=st.session_state.k, step=1)
     use_docs = st.toggle("Use docs/ folder", True)
     uploaded = st.file_uploader("Upload .txt/.md/.pdf", type=["txt", "md", "pdf"], accept_multiple_files=True)
@@ -293,44 +375,54 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Index build failed: {e}")
 
-# ----- Render chat history -----
-for role, msg in st.session_state.messages:
+# ----- Main chat area -----
+# Render messages
+for role, msg in normalize_messages(st.session_state.messages):
     with st.chat_message(role):
         st.markdown(msg)
 
-# Small HTML snippet to auto-scroll to the bottom after render
-components.html(
-    """
-    <script>
-      const out = window.parent.document.querySelector('section.main');
-      if (out) out.scrollTo(0, out.scrollHeight);
-    </script>
-    """,
-    height=0,
-)
-
-# ----- Chat input -----
+# Chat input
 q = st.chat_input("Ask something about your documents…")
 if q:
-    # If it's a brand-new chat, session_id already set; title will be first user msg
+    # Append user message in memory
     st.session_state.messages.append(("user", q))
-    save_chat(st.session_state.session_id, st.session_state.messages)
+
+    # If this is the first message, derive a title and persist the session
+    if not session_path(st.session_state.session_id).exists():
+        st.session_state.title = derive_title_from_messages(st.session_state.messages)
+    # Persist (title + messages) after user turn
+    save_session(st.session_state.session_id, st.session_state.title, st.session_state.messages)
 
     with st.chat_message("user"):
         st.markdown(q)
 
-    # Retrieve & answer
+    # Retrieve context
     try:
         ctx = retrieve(q, st.session_state.k)
-        ans = llm_answer(q, ctx) if ctx else "No relevant information found. Try building the index first."
     except Exception as e:
-        ans = f"Error: {e}"
+        ctx = []
+        with st.chat_message("assistant"):
+            st.error(f"Retrieval error: {e}")
 
-    st.session_state.messages.append(("assistant", ans))
-    save_chat(st.session_state.session_id, st.session_state.messages)
-
+    # Stream assistant answer
     with st.chat_message("assistant"):
-        st.markdown(ans)
+        placeholder = st.empty()
+        streamed_text = ""
+        if ctx:
+            try:
+                for token in llm_answer_stream(q, ctx):
+                    streamed_text += token
+                    placeholder.markdown(streamed_text)
+            except Exception as e:
+                streamed_text += f"\n\n[Streaming error: {e}]"
+                placeholder.markdown(streamed_text)
+        else:
+            streamed_text = "No relevant information found. Try building the index first."
+            placeholder.markdown(streamed_text)
 
-    # Re-render to update sidebar titles if this was the first user turn (title derives from it)
+    # Save final assistant message
+    st.session_state.messages.append(("assistant", streamed_text))
+    save_session(st.session_state.session_id, st.session_state.title, st.session_state.messages)
+
+    # Rerun to refresh sidebar titles/order if this was the first user turn
     st.rerun()
